@@ -2,44 +2,14 @@
 
 from astropy.coordinates import SkyCoord, Longitude, Latitude, EarthLocation, AltAz
 import astropy.time as atime
-from csv import DictReader
 from dataclasses import dataclass
 import getopt
-from math import sqrt, log10, log, fabs
+from math import sqrt, log, fabs
 import numpy as np
-from os import PathLike
-from pathlib import Path
-from statistics import mean, stdev
 import sys
 from typing import Union, Sequence
 
-
-class Measurement:
-    def __init__(self, star, time_start):
-        self.star = star
-        self.time = atime.Time(time_start, scale='utc')
-        self.cnt = dict()
-        self.std_cnt = dict()
-        self.end_time = None
-        self.airmass = None
-
-    def add_counts(self, filt, integ_time, c1, c2, c3):
-        divisor = integ_time / 1000
-        net_cnts = [c1 / divisor, c2 / divisor, c3 / divisor]
-        self.cnt[filt] = mean(net_cnts)
-        self.std_cnt[filt] = stdev(net_cnts)
-
-    def add_sky_counts(self, sky_time, filt, integ_time, c1, c2, c3):
-        divisor = integ_time / 1000
-        net_cnts = [c1 / divisor, c2 / divisor, c3 / divisor]
-        sky_mean = mean(net_cnts)
-        sky_stdev = stdev(net_cnts)
-        self.cnt[filt] = self.cnt[filt] - sky_mean
-        self.std_cnt[filt] = sqrt((self.std_cnt[filt]**2 + sky_stdev**2) / 2)
-        self.end_time = atime.Time(sky_time, scale='utc')
-
-    def calc_time(self):
-        self.time = self.time + ((self.end_time - self.time) / 2)
+from runlog import Measurement, read_measurements
 
 
 @dataclass
@@ -55,36 +25,6 @@ pairs_by_cmp = {
                            SkyCoord('17h17m40.253198052s', '+37d17m29.422635288s', frame='icrs'),
                            1.465, 0.071)
 }
-
-
-def read_measurements(input_name: Union[str, bytes, PathLike]) -> Sequence[Measurement]:
-    input_path = Path(input_name)
-    if not input_path.exists() or not input_path.is_file():
-        raise FileNotFoundError("Input file doesn't exist or isn't a file")
-    measurements = []
-    with open(input_path) as input_file:
-        reader = DictReader(input_file)
-        last_star = None
-        current = None
-        for row in reader:
-            filt = row['Filter']
-            star = row['StarId']
-            if star != last_star:
-                if current is not None:
-                    current.calc_time()
-                    measurements.append(current)
-                current = Measurement(star, row['Timestamp'])
-                last_star = star
-            if row['IsStar'] == 'True':
-                current.add_counts(filt, int(row['IntegrationTime']),
-                                   int(row['Count1']), int(row['Count2']), int(row['Count3']))
-            else:
-                current.add_sky_counts(row['Timestamp'], filt, int(row['IntegrationTime']),
-                                       int(row['Count1']), int(row['Count2']), int(row['Count3']))
-        current.calc_time()
-        measurements.append(current)
-
-        return measurements
 
 
 def calc_airmass(pos: SkyCoord, time: atime.Time, loc: EarthLocation) -> float:

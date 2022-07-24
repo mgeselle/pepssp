@@ -1,310 +1,332 @@
 #!/usr/bin/python3
-from astropy.coordinates import SkyCoord, AltAz, Latitude, Longitude, EarthLocation
-import astropy.units as au
-import astropy.time as atm
-from astropy.utils import iers
-import csv
-import getopt
-import math
-from matplotlib import pyplot as plt
-import numpy as np
-from numpy.linalg import lstsq
-from pathlib import Path
 import sys
+from argparse import ArgumentParser
+import astropy.time as atime
+from astropy.coordinates import EarthLocation, SkyCoord, AltAz, Latitude, Longitude
+from dataclasses import dataclass
+from math import log, log10, sqrt
+import numpy as np
+from os import PathLike
+from pathlib import Path
+from typing import Union, Dict, Literal, Sequence, SupportsFloat
 
-iers.conf.auto_download = False
-
-
-class CatalogStar:
-    star_id = None
-    pos = None
-    v_mag = None
-    ci_bv = None
-
-    def __init__(self, star_id, ra, dec, pos_eq, v_mag, ci_bv):
-        self.star_id = star_id
-        self.pos = SkyCoord(ra, dec, unit=(au.hourangle, au.deg), equinox=atm.Time(pos_eq, format='decimalyear'))
-        self.v_mag = v_mag
-        self.ci_bv = ci_bv
-
-    def airmass(self, obs_time, location):
-        alt_az = self.pos.transform_to(AltAz(obstime=obs_time, location=location))
-        return alt_az.secz.value
+import aavsosp
+from runlog import Measurement, read_measurements
 
 
-class DataPoint:
-    star_id = None
-    star_type = None
-    time_utc = None
-    airmass = None
-    filter_id = None
-    counts_per_sec = None
-
-    def __init__(self, star_id, star_type, time_utc, filter_id, counts_per_sec):
-        self.star_id = star_id
-        self.star_type = star_type
-        self.time_utc = time_utc
-        self.filter_id = filter_id
-        self.counts_per_sec = counts_per_sec
+@dataclass
+class Magnitude:
+    mag: Union[float | SupportsFloat]
+    mag_err: float
 
 
-class Observation:
-    star_id = None
-    c_star_id = None
-    k_star_id = None
-    time_utc = None
-    airmass = None
-    filter_id = None
-    mag_delta = None
-    mag_err = None
-    c_mag = None
-    c_mag_err = None
-    k_mag_delta = None
-
-    def __init__(self, c_star_id, filter_id):
-        self.c_star_id = c_star_id
-        self.filter_id = filter_id
+@dataclass()
+class MeasuredStar:
+    name: str
+    mags: Dict[Literal['B', 'V', 'R', 'I'], Magnitude]
 
 
-def load_catalog(input_file):
-    result = dict()
-    with open(input_file) as input_handle:
-        reader = csv.DictReader(input_handle)
-        for name in ('ID', 'RA', 'DEC', 'V', 'B-V', 'EQ'):
-            if name not in reader.fieldnames:
-                print('Missing field: {}.'.format(name))
-                sys.exit(1)
-        for row in reader:
-            star = CatalogStar(row['ID'], row['RA'], row['DEC'], float(row['EQ']), float(row['V']), float(row['B-V']))
-            result[star.star_id] = star
-
-        return result
+@dataclass
+class MeasuredEnsemble:
+    time: atime.Time
+    pgm: MeasuredStar
+    cmp: MeasuredStar
+    chk: MeasuredStar
 
 
-def load_run_log(run_log_input):
-    result = dict()
-    with open(run_log_input) as input_handle:
-        reader = csv.DictReader(input_handle)
-        for name in (
-                'Timestamp', 'Index', 'StarId', 'StarType', 'IsStar', 'Filter', 'IntegrationTime', 'Count1', 'Count2',
-                'Count3'):
-            if name not in reader.fieldnames:
-                print('Missing field: {}.'.format(name))
-                sys.exit(1)
-        points_by_filter = dict()
-        for row in reader:
-            counts = np.array((int(row['Count1']), int(row['Count2']), int(row['Count3'])))
-            spread = np.max(counts) / np.min(counts)
-            if spread > 1.01:
-                print("Warning: line {:d}: spread of counts {:.1f}%".format(reader.line_num, (spread - 1) * 100))
-            if row['IsStar'] == 'True':
-                points_by_filter[row['Filter']] = DataPoint(row['StarId'],
-                                                            row['StarType'],
-                                                            atm.Time(row['Timestamp']),
-                                                            row['Filter'],
-                                                            100 * np.mean(counts) / int(row['IntegrationTime']))
-            else:
-                data_point = points_by_filter[row['Filter']]
-                data_point.counts_per_sec = data_point.counts_per_sec - 100 * np.mean(counts) / int(
-                    row['IntegrationTime'])
-                if data_point.filter_id not in result:
-                    result[data_point.filter_id] = []
-                result[data_point.filter_id].append(data_point)
-    return result
+@dataclass
+class TransformedEnsemble:
+    time: atime.Time
+    pgm: MeasuredStar
+    chk: MeasuredStar
+    chk_i: MeasuredStar
+    cmp_i: MeasuredStar
+    chk_ref: Dict[Literal['B', 'V', 'R', 'I'], float]
+    pgm_x: float
+    cmp_x: float
+    chk_x: float
 
 
-def fit_line(xvals, yvals):
-    A = np.vstack([xvals, np.ones(len(xvals))]).T
-    fit = lstsq(A, yvals, rcond=-1)
-    a, b = fit[0]
-    mse = fit[1][0] / (len(xvals) - 2)
-    stderr_a = mse / math.sqrt(np.sum(np.square(xvals - np.mean(xvals))))
-    stderr_b = stderr_a * math.sqrt(np.sum(np.square(xvals)))
-
-    return a, b, stderr_a, stderr_b
-
-
-def estimate_extinction(catalog, loc, obs):
-    mag = []
-    airmass = []
-    for o in obs:
-        if o.star_id not in catalog:
-            print('Missing star {}'.format(o.star_id))
-            continue
-        airmass.append(catalog[o.star_id].airmass(o.time_utc, loc))
-        std_mag = catalog[o.star_id].v_mag
-        if o.filter_id == 'B':
-            std_mag = std_mag + catalog[o.star_id].ci_bv
-        mag.append(std_mag + 2.5 * math.log10(o.counts_per_sec))
-    (k, zp, err_k, err_zp) = fit_line(np.array(airmass), np.array(mag))
-    plt.plot(airmass, mag, 'r+')
-    plt.plot(airmass, k * np.array(airmass) + zp, '-')
-    plt.title('Primary extinction plot, {} filter'.format(obs[0].filter_id))
-    plt.show()
-    return k, err_k, zp
+@dataclass
+class TransformParams:
+    starparm: Union[str, bytes, PathLike]
+    epsilon: Dict[Literal['B', 'V'], float]
+    k: Dict[Literal['B', 'V'], float]
+    kk: float
+    location: EarthLocation
+    obs_code: str
+    scope: str
 
 
-def create_observations(data_points, k_prime):
+def form_ensembles(measurements: Sequence[Measurement]) -> Sequence[MeasuredEnsemble]:
     result = []
-    obs = None
-    first_obs_time = None
-    last_obs_time = None
-    expected_types = ['CMP']
-    prev_cmp = None
-    curr_pgm = None
-    pgm_mags = []
-    cmp_mags = []
-    for point in data_points:
-        if point.star_type not in expected_types:
-            print('Type of {} should be in {}, found {}'.format(point.star_id, ', '.join(expected_types), point.star_type))
-            sys.exit(1)
-        if obs is None or (point.star_type == 'CMP' and point.star_id != obs.c_star_id):
-            if obs is not None:
-                finish_obs(obs, pgm_mags, cmp_mags, first_obs_time, last_obs_time)
-                result.append(obs)
-                first_obs_time = None
-                pgm_mags = []
-                cmp_mags = []
-            obs = Observation(point.star_id, point.filter_id)
-            prev_cmp = point
-            cmp_mags.append(-2.5 * math.log10(point.counts_per_sec) - k_prime * point.airmass)
-            expected_types = ['PGM']
-            continue
-        if point.star_type == 'CMP':
-            cmp_mags.append(-2.5 * math.log10(point.counts_per_sec) - k_prime * point.airmass)
-            delta_m = -2.5 * math.log10(2 * curr_pgm.counts_per_sec / (prev_cmp.counts_per_sec + point.counts_per_sec))
-            delta_x = curr_pgm.airmass - (prev_cmp.airmass + point.airmass) / 2
-            delta_m = delta_m - k_prime * delta_x
-            if curr_pgm.star_type == 'CHK':
-                obs.k_mag_delta = delta_m
-            else:
-                pgm_mags.append(delta_m)
-            prev_cmp = point
-            expected_types = ['PGM', 'CHK', 'CMP']
-        else:
-            curr_pgm = point
-            expected_types = ['CMP']
-            if point.star_type == 'PGM':
-                if first_obs_time is None:
-                    first_obs_time = point.time_utc
-                else:
-                    last_obs_time = point.time_utc
-                if obs.star_id is None:
-                    obs.star_id = point.star_id
-            elif obs.k_star_id is None:
-                obs.k_star_id = point.star_id
+    cmp_counts = dict()
+    cmp_count_errs = dict()
+    last_cmp_count = dict()
+    last_cmp_count_err = dict()
+    pgm_counts = dict()
+    pgm_count_errs = dict()
+    cmp_idx = 0
+    pgm_name = None
+    cmp_name = None
+    chk_name = None
+    chk_count = dict()
+    chk_count_err = dict()
+    time = None
+    err_factor = 2.5 / log(10)
+    for measurement in measurements:
+        if measurement.star_type == 'CMP':
+            if cmp_name is None:
+                cmp_name = measurement.star
+            for filt in measurement.cnt.keys():
+                if filt not in cmp_counts:
+                    cmp_counts[filt] = np.empty(5)
+                    cmp_count_errs[filt] = np.empty(5)
+                cmp_count_errs[filt][cmp_idx] = measurement.std_cnt[filt]
+                cmp_counts[filt][cmp_idx] = measurement.cnt[filt]
+                last_cmp_count[filt] = measurement.cnt[filt]
+                last_cmp_count_err[filt] = measurement.std_cnt[filt]
+            cmp_idx = cmp_idx + 1
+        elif measurement.star_type == 'PGM':
+            if pgm_name is None:
+                pgm_name = measurement.star
+            if cmp_idx == 0:
+                # Back-to-back measurement of same star...
+                for filt in last_cmp_count.keys():
+                    cmp_counts[filt][0] = last_cmp_count[filt]
+                    cmp_count_errs[filt][0] = last_cmp_count_err[filt]
+                cmp_idx = 1
+            if cmp_idx == 2:
+                time = measurement.time
+            for filt in measurement.cnt.keys():
+                if filt not in pgm_counts:
+                    pgm_counts[filt] = np.empty(3)
+                    pgm_count_errs[filt] = np.empty(3)
+                pgm_count_errs[filt][cmp_idx - 1] = measurement.std_cnt[filt]
+                pgm_counts[filt][cmp_idx - 1] = measurement.cnt[filt]
+        elif measurement.star_type == 'CHK':
+            if chk_name is None:
+                chk_name = measurement.star
+            for filt in measurement.cnt.keys():
+                chk_count[filt] = measurement.cnt[filt]
+                chk_count_err[filt] = measurement.std_cnt[filt]
 
-    if obs is not None:
-        finish_obs(obs, pgm_mags, cmp_mags, first_obs_time, last_obs_time)
-        result.append(obs)
+        if cmp_idx == 5:
+            cmp_mags = dict()
+            pgm_mags = dict()
+            chk_mags = dict()
+            for filt in cmp_counts.keys():
+                cmp_count_errs[filt] = cmp_count_errs[filt] / cmp_counts[filt] * err_factor
+                cmp_counts[filt] = np.log10(cmp_counts[filt]) * -2.5
+                cmp_mags[filt] = Magnitude(np.mean(cmp_counts[filt]), sqrt(np.mean(cmp_count_errs[filt] ** 2) / 4))
+                pgm_count_errs[filt] = pgm_count_errs[filt] / pgm_counts[filt] * err_factor
+                pgm_counts[filt] = np.log10(pgm_counts[filt]) * -2.5
+                pgm_mags[filt] = Magnitude(np.mean(pgm_counts[filt]), sqrt(np.mean(pgm_count_errs[filt] ** 2) / 3))
+                chk_mags[filt] = Magnitude(-2.5 * log10(chk_count[filt]),
+                                           err_factor * chk_count_err[filt] / chk_count[filt])
+            cmp_star = MeasuredStar(cmp_name, cmp_mags)
+            pgm_star = MeasuredStar(pgm_name, pgm_mags)
+            chk_star = MeasuredStar(chk_name, chk_mags)
+            ensemble = MeasuredEnsemble(time, pgm_star, cmp_star, chk_star)
+            result.append(ensemble)
+
+            cmp_idx = 0
+            cmp_name = None
+            pgm_name = None
+            chk_name = None
+            time = None
+            # Clearing out filters, because they might change from
+            # observation to observation.
+            cmp_counts = dict()
+            cmp_count_errs = dict()
+            pgm_counts = dict()
+            pgm_count_errs = dict()
+            chk_count = dict()
+            chk_count_err = dict()
 
     return result
 
 
-def finish_obs(obs, pgm_mags, cmp_mags, first_obs_time, last_obs_time):
-    obs.time_utc = first_obs_time + (last_obs_time - first_obs_time) / 2
-    if len(pgm_mags) > 0:
-        np_mags = np.array(pgm_mags)
-        obs.mag_delta = np.mean(np_mags)
-        obs.mag_err = np.std(np_mags)
-        np_mags = np.array(cmp_mags)
-        obs.c_mag = np.mean(np_mags)
-        obs.c_mag_err = np.std(np_mags)
+def _calc_airmass(pos: SkyCoord, loc: EarthLocation, time: atime.Time):
+    return pos.transform_to(AltAz(obstime=time, location=loc)).secz
 
 
-# >>>> Main
-try:
-    opts, args = getopt.getopt(sys.argv[1:], 'b:c:f:o:a:h:v:')
-except getopt.GetoptError as err:
-    print(err)
-    sys.exit(1)
+def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams) -> Sequence[TransformedEnsemble]:
+    result = []
+    for observation in observations:
+        ensemble = aavsosp.locate_ensemble(params.starparm, observation.pgm.name)
+        if ensemble is None:
+            print(f'Star {observation.pgm.name} not found in starparm file.')
+            continue
+        mags = dict()
+        chk_mags = dict()
+        m_chk_ref = dict()
+        pgm_airmass = _calc_airmass(ensemble.pgm.pos, params.location, observation.time)
+        cmp_airmass = _calc_airmass(ensemble.cmp.pos, params.location, observation.time)
+        chk_airmass = _calc_airmass(ensemble.chk.pos, params.location, observation.time)
+        for filt in observation.pgm.mags.keys():
+            if filt == 'B':
+                m_ref = ensemble.cmp.bmv + ensemble.cmp.vmag
+                m_chk_ref[filt] = ensemble.chk.bmv + ensemble.chk.vmag
+            elif filt == 'V':
+                m_ref = ensemble.cmp.vmag
+                m_chk_ref[filt] = ensemble.chk.vmag
+            else:
+                print(f'Unsupported filter: {filt}')
+                continue
+            pgm_mag = m_ref + observation.pgm.mags[filt].mag - observation.cmp.mags[filt].mag + \
+                params.epsilon[filt] * (ensemble.pgm.bmv - ensemble.cmp.bmv) - \
+                params.k[filt] * (pgm_airmass - cmp_airmass)
+            chk_mag = m_ref + observation.chk.mags[filt].mag - observation.cmp.mags[filt].mag
+            chk_mag = chk_mag + params.epsilon[filt] * (ensemble.chk.bmv - ensemble.cmp.bmv)
+            chk_mag = chk_mag + params.k[filt] * (chk_airmass - cmp_airmass)
+            if filt == 'B':
+                pgm_cmp_am = (pgm_airmass + cmp_airmass) / 2
+                chk_cmp_am = (chk_airmass + cmp_airmass) / 2
+                bmv_pgm = observation.pgm.mags['B'].mag - observation.pgm.mags['V'].mag
+                bmv_cmp = observation.cmp.mags['B'].mag - observation.cmp.mags['V'].mag
+                bmv_chk = observation.chk.mags['B'].mag - observation.chk.mags['V'].mag
+                pgm_mag = pgm_mag - params.kk * pgm_cmp_am * (bmv_pgm - bmv_cmp)
+                chk_mag = chk_mag - params.kk * chk_cmp_am * (bmv_chk - bmv_cmp)
+                err_pgm = sqrt(((1 - params.kk * pgm_cmp_am) * observation.pgm.mags['B'].mag_err) ** 2 +
+                               ((1 - params.kk * pgm_cmp_am) * observation.cmp.mags['B'].mag_err) ** 2 +
+                               (params.kk * pgm_cmp_am * observation.pgm.mags['V'].mag_err) ** 2 +
+                               (params.kk * pgm_cmp_am * observation.cmp.mags['V'].mag_err) ** 2)
+                err_chk = sqrt(((1 - params.kk * chk_cmp_am) * observation.chk.mags['B'].mag_err) ** 2 +
+                               ((1 - params.kk * chk_cmp_am) * observation.cmp.mags['B'].mag_err) ** 2 +
+                               (params.kk * chk_cmp_am * observation.chk.mags['V'].mag_err) ** 2 +
+                               (params.kk * chk_cmp_am * observation.cmp.mags['V'].mag_err) ** 2)
+            else:
+                err_pgm = sqrt(observation.pgm.mags[filt].mag_err ** 2 + observation.cmp.mags[filt].mag_err ** 2)
+                err_chk = sqrt(observation.chk.mags[filt].mag_err ** 2 + observation.cmp.mags[filt].mag_err ** 2)
+            mags[filt] = Magnitude(pgm_mag, err_pgm)
+            chk_mags[filt] = Magnitude(chk_mag, err_chk)
+        pgm = MeasuredStar(ensemble.pgm.usename, mags)
+        chk = MeasuredStar(ensemble.chk.usename, chk_mags)
+        chk_i = MeasuredStar(ensemble.chk.usename, observation.chk.mags)
+        cmp_i = MeasuredStar(ensemble.cmp.usename, observation.cmp.mags)
+        xf = TransformedEnsemble(observation.time, pgm, chk, chk_i, cmp_i, m_chk_ref,
+                                 pgm_airmass, cmp_airmass, chk_airmass)
+        result.append(xf)
 
-catalog_file = None
-run_log = None
-longitude = None
-latitude = None
-geo_alt = 0.0
-epsilon = dict()
+    return result
 
-for opt, arg in opts:
-    if opt == '-c':
-        catalog_file = Path(arg)
-    elif opt == '-f':
-        run_log = Path(arg)
-    elif opt == '-o':
-        longitude = Longitude(arg, unit='degree')
-    elif opt == '-a':
-        latitude = Latitude(arg, unit='degree')
-    elif opt == '-h':
-        geo_alt = float(arg)
-    elif opt == '-b':
-        epsilon['B'] = float(arg)
-    elif opt == '-v':
-        epsilon['V'] = float(arg)
-    else:
-        print('Unsupported option {}'.format(opt))
-        sys.exit(1)
 
-if catalog_file is None:
-    print('Catalog file not specified.')
-    sys.exit(1)
-if not catalog_file.exists():
-    print('Catalog file does not exist.')
-    sys.exit(1)
-if run_log is None:
+def report(stars: Sequence[TransformedEnsemble]):
+    if len(stars) == 0:
+        return
+    print()
+    print('++++++++++++++++ Results +++++++++++++')
+    print()
+    for star in stars:
+        usename = star.pgm.name
+        time_str = star.time.strftime('%d.%m.%Y %H:%M:%S')
+        print(f'{usename} at {time_str} UTC (JD={star.time.jd:13.5f})')
+        print()
+        print('  PGM   ERR   CHK   ERR   CHK Ref')
+        print('---------------------------------')
+        for filt in star.pgm.mags:
+            m_pgm = star.pgm.mags[filt].mag
+            me_pgm = star.pgm.mags[filt].mag_err
+            m_chk = star.chk.mags[filt].mag
+            me_chk = star.chk.mags[filt].mag_err
+            mr_chk = star.chk_ref[filt]
+            print(f'{filt} {m_pgm:5.3f} {me_pgm:5.3f} {m_chk:5.3f} {me_chk:5.3f} {mr_chk:5.3f}')
+
+
+def write_aavso(stars: Sequence[TransformedEnsemble], file_name: Union[str, bytes, PathLike],
+                params: TransformParams):
+    if len(stars) == 0:
+        return
+    file_path = Path(file_name)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with file_path.open('w') as out:
+        print('#TYPE=Extended', file=out)
+        print(f'#OBSCODE={params.obs_code}', file=out)
+        print('#SOFTWARE=pep-reduce.py, see: https://github.com/mgeselle/pepssp', file=out)
+        print('#DELIM=,', file=out)
+        print('#DATE=JD', file=out)
+        print('#OBSTYPE=PEP', file=out)
+
+        lat_i = int(round(params.location.lat.deg))
+        if lat_i > 0:
+            lat_ns = 'N'
+        else:
+            lat_ns = 'S'
+        lon_i = int(round(params.location.lon.deg))
+        if lon_i > 0:
+            lon_ew = 'E'
+        else:
+            lon_ew = 'W'
+        notes_pfx = f'SCOPE={params.scope}|SENSOR=SSP3|LOC={lat_i}{lat_ns}/{lon_i}{lon_ew}|INDEX=BV'
+
+        for star in stars:
+            usename = star.pgm.name
+            pgm_x = star.pgm_x
+            cmp_x = star.cmp_x
+            chk_x = star.chk_x
+            jd = star.time.jd
+            for filt in star.pgm.mags.keys():
+                notes = notes_pfx + f'|CX={cmp_x:5.3f}|KX={chk_x:5.3f}|K_{filt}={params.k[filt]:4.2f}'
+                if filt == 'B':
+                    notes = notes + f'|KK_B={params.kk:5.2f}|TB_BV={params.epsilon[filt]:4.2f}'
+                elif filt == 'V':
+                    notes = notes + f'|TV_BV={params.epsilon[filt]:4.2f}'
+                pgm_mag = star.pgm.mags[filt].mag
+                pgm_err = star.pgm.mags[filt].mag_err
+                cname = star.cmp_i.name
+                cmag = star.cmp_i.mags[filt].mag
+                kname = star.chk_i.name
+                kmag = star.chk_i.mags[filt].mag
+                line = f'{usename},{jd:13.5f},{pgm_mag:5.3f},{pgm_err:5.3f},{filt}'
+                line = line + f',YES,STD,{cname},{cmag:5.3f},{kname},{kmag:5.3f}'
+                line = line + f',{pgm_x:5.3f},na,PEP,{notes}'
+
+                print(line, file=out)
+
+
+parser = ArgumentParser(description='Perform data reduction on a peppy run log.')
+parser.add_argument('run_log', help='peppy run log')
+parser.add_argument('-o', '--out', help='output AAVSO photometry file')
+parser.add_argument('--kb', type=float, help='primary extinction coefficient for B',
+                    default=0.351)
+parser.add_argument('--kv', type=float, help='primary extinction coefficient for V',
+                    default=0.201)
+parser.add_argument('--kk', type=float, help='secondary extinction coefficient for B',
+                    default=-0.026)
+parser.add_argument('--eb', type=float, help='transformation coefficient for B',
+                    default=0.1476)
+parser.add_argument('--ev', type=float, help='transformation coefficient for V',
+                    default=-0.0196)
+parser.add_argument('--starparm', help='AAVSO starparm file',
+                    default=str(Path.home() / 'Documents/astro/starparm_2021Aug27.csv'))
+parser.add_argument('--lat', help='geographic latitude of observatory',
+                    default='50d6m17s')
+parser.add_argument('--lon', help='geographic longitude of observatory',
+                    default='8d32m12s')
+parser.add_argument('--alt', type=float, help='altitude above MSL of observatory',
+                    default=110)
+parser.add_argument('--obs', help='AAVSO Observer Code', default='GMV')
+parser.add_argument('--sco', help='Telescope used', default='8IN_RC')
+
+args = parser.parse_args()
+
+eps = {'B': args.eb, 'V': args.ev}
+k = {'B': args.kb, 'V': args.kv}
+lat = Latitude(args.lat)
+lon = Longitude(args.lon)
+
+# noinspection PyTypeChecker
+xform_params = TransformParams(args.starparm, eps, k, args.kk,
+                               EarthLocation(lat=lat, lon=lon, height=args.alt),
+                               args.obs, args.sco)
+if 'run_log' not in args:
     print('Run log not specified.')
     sys.exit(1)
-if not run_log.exists():
-    print('Run log does not exist.')
-    sys.exit(1)
-if longitude is None:
-    print('Longitude not specified.')
-    sys.exit(1)
-if latitude is None:
-    print('Latitude not specified')
-    sys.exit(1)
 
-obs_location = EarthLocation(longitude, latitude, geo_alt)
-print('Loading catalog from {}'.format(catalog_file.absolute()))
-stars_by_id = load_catalog(catalog_file)
-print('Loading run from {}'.format(run_log.absolute()))
-raw_counts_by_filter = load_run_log(run_log)
-for filter_counts in raw_counts_by_filter.values():
-    for raw_counts in filter_counts:
-        raw_counts.airmass = stars_by_id[raw_counts.star_id].airmass(raw_counts.time_utc, obs_location)
-
-k_by_filter = {f: 0.0 for f in raw_counts_by_filter}
-obs_by_filter = dict()
-for filt_id in k_by_filter:
-    extinction_pts = [p for p in raw_counts_by_filter[filt_id] if p.star_type == 'EXT']
-    if len(extinction_pts) > 0:
-        print('Estimating primary extinction for filter {}'.format(filt_id))
-        (k, err_k, zp) = estimate_extinction(stars_by_id, obs_location, extinction_pts)
-        print("k'({}) = {:5.3f}({:5.3f}), zeta = {:6.3f}".format(filt_id, -k, err_k, zp))
-        k_by_filter[filt_id] = -k
-    else:
-        k_by_filter[filt_id] = 0.0
-
-    obs_pts = [p for p in raw_counts_by_filter[filt_id] if p.star_type in ['CMP', 'CHK', 'PGM']]
-    obs_by_filter[filt_id] = create_observations(obs_pts, k_by_filter[filt_id])
-    if filt_id not in epsilon:
-        epsilon[filt_id] = 0.0
-    print('Using epsilon_{} = {:5.3f}'.format(filt_id, epsilon[filt_id]))
-    for obs in obs_by_filter[filt_id]:
-        if filt_id == 'V':
-            mag = stars_by_id[obs.c_star_id].v_mag + obs.mag_delta
-        else:
-            mag = stars_by_id[obs.c_star_id].ci_bv + stars_by_id[obs.c_star_id].v_mag + obs.mag_delta
-
-        mag = mag + epsilon[filt_id] * stars_by_id[obs.star_id].ci_bv
-        c_mag = obs.c_mag + zp + epsilon[filt_id] * stars_by_id[obs.c_star_id].ci_bv
-
-        print('Observation {}@{}'.format(obs.star_id, filt_id))
-        print('Mag: {:5.3f}({:5.3f})'.format(mag, obs.mag_err))
-        print('CMag: {:5.3f}({:5.3f}), Abs: {:5.3f}'.format(obs.c_mag, obs.c_mag_err, c_mag))
-        print('KMag: {:5.3f}'.format(obs.k_mag_delta + obs.c_mag))
-        print('Airmass: {:5.3f}'.format(stars_by_id[obs.star_id].airmass(obs.time_utc, obs_location)))
-        obs_time_hc = obs.time_utc.utc + obs.time_utc.light_travel_time(stars_by_id[obs.star_id].pos,
-                                                                     kind='heliocentric',
-                                                                     location=obs_location)
-        print('HJD: {:14.6f}'.format(obs_time_hc.jd))
+m = read_measurements(args.run_log)
+e = form_ensembles(m)
+x = transform(e, xform_params)
+report(x)
+if 'out' in args:
+    write_aavso(x, args.out, xform_params)
