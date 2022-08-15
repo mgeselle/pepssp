@@ -160,6 +160,7 @@ def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams)
             continue
         mags = dict()
         chk_mags = dict()
+        chk_i_mags = dict()
         m_chk_ref = dict()
         pgm_airmass = _calc_airmass(ensemble.pgm.pos, params.location, observation.time)
         cmp_airmass = _calc_airmass(ensemble.cmp.pos, params.location, observation.time)
@@ -167,7 +168,10 @@ def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams)
         for filt in observation.pgm.mags.keys():
             if filt == 'B':
                 m_ref = ensemble.cmp.bmv + ensemble.cmp.vmag
-                m_chk_ref[filt] = ensemble.chk.bmv + ensemble.chk.vmag
+                if ensemble.chk.bmv is None:
+                    m_chk_ref[filt] = None
+                else:
+                    m_chk_ref[filt] = ensemble.chk.bmv + ensemble.chk.vmag
             elif filt == 'V':
                 m_ref = ensemble.cmp.vmag
                 m_chk_ref[filt] = ensemble.chk.vmag
@@ -177,8 +181,11 @@ def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams)
             pgm_mag = m_ref + observation.pgm.mags[filt].mag - observation.cmp.mags[filt].mag + \
                 params.epsilon[filt] * (ensemble.pgm.bmv - ensemble.cmp.bmv) - \
                 params.k[filt] * (pgm_airmass - cmp_airmass)
-            chk_mag = m_ref + observation.chk.mags[filt].mag - observation.cmp.mags[filt].mag
-            chk_mag = chk_mag + params.epsilon[filt] * (ensemble.chk.bmv - ensemble.cmp.bmv)
+            chk_mag = m_ref + observation.chk.mags[filt].mag - observation.cmp.mags[filt].mag - \
+                params.k[filt] * (chk_airmass - cmp_airmass)
+            chk_i_mag = chk_mag
+            if ensemble.chk.bmv is not None:
+                chk_mag = chk_mag + params.epsilon[filt] * (ensemble.chk.bmv - ensemble.cmp.bmv)
             chk_mag = chk_mag + params.k[filt] * (chk_airmass - cmp_airmass)
             if filt == 'B':
                 pgm_cmp_am = (pgm_airmass + cmp_airmass) / 2
@@ -188,6 +195,7 @@ def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams)
                 bmv_chk = observation.chk.mags['B'].mag - observation.chk.mags['V'].mag
                 pgm_mag = pgm_mag - params.kk * pgm_cmp_am * (bmv_pgm - bmv_cmp)
                 chk_mag = chk_mag - params.kk * chk_cmp_am * (bmv_chk - bmv_cmp)
+                chk_i_mag = chk_i_mag - params.kk * chk_cmp_am * (bmv_chk - bmv_cmp)
                 err_pgm = sqrt(((1 - params.kk * pgm_cmp_am) * observation.pgm.mags['B'].mag_err) ** 2 +
                                ((1 - params.kk * pgm_cmp_am) * observation.cmp.mags['B'].mag_err) ** 2 +
                                (params.kk * pgm_cmp_am * observation.pgm.mags['V'].mag_err) ** 2 +
@@ -201,9 +209,10 @@ def transform(observations: Sequence[MeasuredEnsemble], params: TransformParams)
                 err_chk = sqrt(observation.chk.mags[filt].mag_err ** 2 + observation.cmp.mags[filt].mag_err ** 2)
             mags[filt] = Magnitude(pgm_mag, err_pgm)
             chk_mags[filt] = Magnitude(chk_mag, err_chk)
+            chk_i_mags[filt] = Magnitude(chk_i_mag, err_chk)
         pgm = MeasuredStar(ensemble.pgm.usename, mags)
         chk = MeasuredStar(ensemble.chk.usename, chk_mags)
-        chk_i = MeasuredStar(ensemble.chk.usename, observation.chk.mags)
+        chk_i = MeasuredStar(ensemble.chk.usename, chk_i_mags)
         cmp_i = MeasuredStar(ensemble.cmp.usename, observation.cmp.mags)
         xf = TransformedEnsemble(observation.time, pgm, chk, chk_i, cmp_i, m_chk_ref,
                                  pgm_airmass, cmp_airmass, chk_airmass)
@@ -231,7 +240,10 @@ def report(stars: Sequence[TransformedEnsemble]):
             m_chk = star.chk.mags[filt].mag
             me_chk = star.chk.mags[filt].mag_err
             mr_chk = star.chk_ref[filt]
-            print(f'{filt} {m_pgm:5.3f} {me_pgm:5.3f} {m_chk:5.3f} {me_chk:5.3f} {mr_chk:5.3f}')
+            if mr_chk is not None:
+                print(f'{filt} {m_pgm:5.3f} {me_pgm:5.3f} {m_chk:5.3f} {me_chk:5.3f} {mr_chk:5.3f}')
+            else:
+                print(f'{filt} {m_pgm:5.3f} {me_pgm:5.3f} {m_chk:5.3f} {me_chk:5.3f} -----')
 
 
 def write_aavso(stars: Sequence[TransformedEnsemble], file_name: Union[str, bytes, PathLike],
@@ -328,5 +340,5 @@ m = read_measurements(args.run_log)
 e = form_ensembles(m)
 x = transform(e, xform_params)
 report(x)
-if 'out' in args:
+if 'out' in args and args.out is not None:
     write_aavso(x, args.out, xform_params)

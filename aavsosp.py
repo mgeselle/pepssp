@@ -4,6 +4,7 @@ from astroquery.simbad import Simbad
 import astropy.units as u
 from csv import DictReader
 from dataclasses import dataclass
+import numpy.ma as npm
 from os import PathLike
 from pathlib import Path
 from typing import Union
@@ -74,7 +75,14 @@ def locate_ensemble(parm_file: Union[str, bytes, PathLike], sao_pgm: str) -> Uni
                 chk_de_str = _tuple_to_dms(int(line['kded']), int(line['kdem']), float(line['kdes']))
                 chk_pos = SkyCoord(chk_ra_str, chk_de_str, unit=(u.hourangle, u.deg))
                 chk_vmag = float(line['kvmag'])
-                chk_bmv = float(line['deltabmv'])
+                Simbad.add_votable_fields('flux(B)', 'flux(V)', 'id(SAO)')
+                chk_table = Simbad.query_object(chk_name)
+                for chk_id, chk_b in chk_table.iterrows('MAIN_ID', 'FLUX_B'):
+                    if chk_b is not npm.masked:
+                        chk_bmv = float(chk_b) - chk_vmag
+                        print(f'CHK B - V: {chk_bmv:.3f}')
+                    else:
+                        chk_bmv = None
                 chk = Star(chk_name, None, chk_pos, None, chk_vmag, chk_bmv)
 
                 return Ensemble(pgm, cmp, chk)
